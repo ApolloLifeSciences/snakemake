@@ -159,7 +159,7 @@ class Batch:
                 "Batching rule {} has less input files than batches. "
                 "Please choose a smaller number of batches.".format(self.rulename)
             )
-        items = sorted(items)
+        #items = sorted(items)
 
         # we can equally split items using divmod:
         # len(items) = (self.batches * quotient) + remainder
