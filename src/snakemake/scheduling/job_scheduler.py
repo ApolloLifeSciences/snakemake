@@ -1,36 +1,42 @@
 from __future__ import annotations
 
+import os
+from queue import Empty, SimpleQueue
+
+from watchdog.events import FileSystemEventHandler
+from watchdog.observers import Observer
+
 __author__ = "Johannes Köster"
 __copyright__ = "Copyright 2022, Johannes Köster"
 __email__ = "johannes.koester@uni-due.de"
 __license__ = "MIT"
 
 import asyncio
+import copy
+import signal
+import sys
+import threading
+import time
 from bisect import bisect
 from collections import deque
-import copy
-import signal, sys
-import threading
-
-from itertools import chain, accumulate, filterfalse, repeat
+from collections.abc import Iterable, Sequence
 from contextlib import ContextDecorator
-import time
-from typing import Iterable, Sequence, TYPE_CHECKING
+from itertools import accumulate, chain, filterfalse, repeat
+from typing import TYPE_CHECKING
 
-from snakemake_interface_executor_plugins.scheduler import JobSchedulerExecutorInterface
 from snakemake_interface_executor_plugins.registry import ExecutorPluginRegistry
 from snakemake_interface_executor_plugins.registry import Plugin as ExecutorPlugin
+from snakemake_interface_executor_plugins.scheduler import JobSchedulerExecutorInterface
 from snakemake_interface_executor_plugins.settings import ExecMode
 from snakemake_interface_logger_plugins.common import LogEvent
-from snakemake.io import _IOFile
-from snakemake.jobs import AbstractJob
 from snakemake_interface_scheduler_plugins.base import SchedulerBase
 from snakemake_interface_scheduler_plugins.registry import SchedulerPluginRegistry
 
 from snakemake.exceptions import RuleException, WorkflowError, print_exception
+from snakemake.io import _IOFile
+from snakemake.jobs import AbstractJob
 from snakemake.logging import logger
 from snakemake.scheduling.greedy import SchedulerSettings as GreedySchedulerSettings
-
 from snakemake.settings.enums import Quietness
 from snakemake.settings.types import MaxJobsPerTimespan, SharedFSUsage
 
@@ -62,6 +68,33 @@ class DummyRateLimiter(ContextDecorator):
         return False
 
 
+class DP2ExternalFileHandler(FileSystemEventHandler):
+    """Forward filesystem events to the Snakemake scheduler."""
+
+    def __init__(self, notify):
+        super().__init__()
+        self.notify = notify
+
+    def on_created(self, event):
+        if not event.is_directory:
+            if not getattr(self, "_logged_first_event", False):
+                print(
+                    f"[WATCHER] First file: {event.src_path}",
+                    flush=True,
+                )
+                self._logged_first_event = True
+
+            self.notify(event.src_path)
+
+    def on_modified(self, event):
+        if not event.is_directory:
+            self.notify(event.src_path)
+
+    def on_moved(self, event):
+        if not event.is_directory:
+            self.notify(event.dest_path)
+
+
 class JobScheduler(JobSchedulerExecutorInterface):
     def __init__(
         self,
@@ -72,6 +105,11 @@ class JobScheduler(JobSchedulerExecutorInterface):
     ):
         """Create a new instance of KnapsackJobScheduler."""
         self.workflow = workflow
+
+        self._dp2_external_events = SimpleQueue()
+        self._dp2_event_lock = threading.Lock()
+        self._dp2_wakeup_pending = False
+        self._dp2_external_observer = None
 
         self.dryrun = self.workflow.dryrun
         self.touch = self.workflow.touch
@@ -175,6 +213,104 @@ class JobScheduler(JobSchedulerExecutorInterface):
             pass
         self._open_jobs.release()
 
+    def _dp2_notify_external(self, path):
+        """Called by the watcher thread.
+
+        Never modifies the DAG directly.
+        """
+        path = os.path.normcase(os.path.abspath(path))
+
+        if not hasattr(self, "_dp2_event_count"):
+            self._dp2_event_count = 0
+
+        self._dp2_event_count += 1
+
+        if self._dp2_event_count % 10 == 0:
+            print(
+                f"[WATCHER] {time.perf_counter():.3f} events={self._dp2_event_count}",
+                flush=True,
+            )
+
+        with self._dp2_event_lock:
+            self._dp2_external_events.put(path)
+
+            if not self._dp2_wakeup_pending:
+                self._dp2_wakeup_pending = True
+                self._open_jobs.release()
+
+    def _dp2_drain_external_events(self):
+        paths = set()
+
+        with self._dp2_event_lock:
+            while True:
+                try:
+                    paths.add(self._dp2_external_events.get_nowait())
+                except Empty:
+                    break
+
+            self._dp2_wakeup_pending = False
+
+        if paths:
+            dag = self.workflow.dag
+
+            waiting_before = len(dag._dp2_waiting_external)
+
+            dag._dp2_check_external_paths(paths)
+
+            waiting_after = len(dag._dp2_waiting_external)
+
+            if not getattr(self, "_dp2_logged_first_batch", False):
+                print(
+                    f"[SCHEDULER] First batch: "
+                    f"events={len(paths)}, "
+                    f"waiting_before={waiting_before}, "
+                    f"waiting_after={waiting_after}, "
+                    f"ready={len(dag.ready_jobs)}",
+                    flush=True,
+                )
+                self._dp2_logged_first_batch = True
+
+    def _dp2_start_external_watcher(self):
+        """Watch the common directory of expected external inputs."""
+        dag = self.workflow.dag
+
+        if not dag._dp2_waiting_external:
+            return
+
+        directories = [os.path.dirname(path) for path in dag._dp2_waiting_external]
+
+        watch_root = os.path.commonpath(directories)
+
+        # For the isolated test, ensure the raw root exists.
+        os.makedirs(watch_root, exist_ok=True)
+
+        observer = Observer()
+        observer.schedule(
+            DP2ExternalFileHandler(self._dp2_notify_external),
+            watch_root,
+            recursive=True,
+        )
+        observer.start()
+
+        self._dp2_external_observer = observer
+
+        logger.info(f"[EXTERNAL] Watching {watch_root}")
+
+        # Reconcile files created before watcher startup.
+        dag._dp2_check_external_paths(list(dag._dp2_waiting_external))
+
+        logger.info(
+            f"[EXTERNAL] Initial waiting files: {len(dag._dp2_waiting_external)}"
+        )
+
+    def _dp2_stop_external_watcher(self):
+        observer = self._dp2_external_observer
+
+        if observer is not None:
+            observer.stop()
+            observer.join()
+            self._dp2_external_observer = None
+
     def executor_error_callback(self, exception):
         with self._lock:
             self._executor_error = exception
@@ -219,6 +355,12 @@ class JobScheduler(JobSchedulerExecutorInterface):
     def schedule(self):
         """Schedule jobs that are ready, maximizing cpu usage."""
         try:
+            print(
+                f"[DP2 DEBUG] NEW SCHEDULER CODE LOADED, PID={os.getpid()}",
+                flush=True,
+            )
+            self._dp2_start_external_watcher()
+
             while True:
                 if self.workflow.dag.queue_input_jobs:
                     self.update_queue_input_jobs()
@@ -226,12 +368,30 @@ class JobScheduler(JobSchedulerExecutorInterface):
                 # while not self._open_jobs.acquire(False):
                 #    time.sleep(1)
                 self._open_jobs.acquire()
+                cycle_start = time.perf_counter()
 
                 # obtain needrun and running jobs in a thread-safe way
                 with self._lock:
                     self._finish_jobs()
                     self._error_jobs()
+
+                    self._dp2_drain_external_events()
+
+                    drain_s = time.perf_counter() - cycle_start
+
+                    if drain_s > 0.1:
+                        print(
+                            f"[SCHEDULER] Event processing: {drain_s:.3f}s",
+                            flush=True,
+                        )
+
                     needrun = set(self.open_jobs)
+                    if needrun and not getattr(self, "_dp2_logged_first_ready", False):
+                        print(
+                            f"[SCHEDULER] First ready jobs: {len(needrun)}",
+                            flush=True,
+                        )
+                        self._dp2_logged_first_ready = True
                     running = list(self.running)
                     errors = self._errors
                     executor_error = self._executor_error
@@ -263,6 +423,7 @@ class JobScheduler(JobSchedulerExecutorInterface):
                         or self.workflow.remote_execution_settings.immediate_submit
                     )
                     and not self.workflow.dag.has_unfinished_queue_input_jobs()
+                    and not self.workflow.dag._dp2_waiting_external
                 ):
                     self._executor.shutdown()
                     if errors:
@@ -285,10 +446,10 @@ class JobScheduler(JobSchedulerExecutorInterface):
                 if not needrun:
                     if self.workflow.dag.has_unfinished_queue_input_jobs():
                         logger.info("Waiting for queue input...")
-                        # schedule a reevaluation in 10 seconds
                         self._schedule_reevalutation(
                             self.workflow.execution_settings.queue_input_wait_time
                         )
+
                     continue
 
                 # select jobs by solving knapsack problem (omit with dryrun)
@@ -317,7 +478,16 @@ class JobScheduler(JobSchedulerExecutorInterface):
 
                     if not self._last_job_selection_empty:
                         logger.info("Select jobs to execute...")
+                    t0 = time.perf_counter()
                     run = self.job_selector(needrun)
+                    selection_s = time.perf_counter() - t0
+
+                    if selection_s > 0.1:
+                        print(
+                            f"[SCHEDULER] Selection: {selection_s:.3f}s "
+                            f"ready={len(needrun)} selected={len(run)}",
+                            flush=True,
+                        )
                     self._last_job_selection_empty = not run
 
                     logger.debug(f"Selected jobs: {len(run)}")
@@ -406,6 +576,8 @@ class JobScheduler(JobSchedulerExecutorInterface):
             # as well, so that no unmanaged jobs remain.
             self._executor.cancel()
             raise e
+        finally:
+            self._dp2_stop_external_watcher()
 
     def _schedule_reevalutation(self, delay: int) -> None:
         threading.Timer(
@@ -599,9 +771,9 @@ class JobScheduler(JobSchedulerExecutorInterface):
         # get number of free jobs to submit
         if self.job_rate_limiter is None:
             # ensure that the job count is not restricted
-            assert (
-                self.resources["_job_count"] == sys.maxsize
-            ), f"Job count is {self.resources['_job_count']}, but should be {sys.maxsize}"
+            assert self.resources["_job_count"] == sys.maxsize, (
+                f"Job count is {self.resources['_job_count']}, but should be {sys.maxsize}"
+            )
             return run_selector(self._job_selector)
         n_free_jobs = self.job_rate_limiter.get_free_jobs()
         if n_free_jobs == 0:

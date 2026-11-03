@@ -10,44 +10,41 @@ import copy
 import functools
 import hashlib
 import os
+import pickle
 import queue
 import re
 import shutil
 import stat
 import string
 import time
+from collections.abc import Callable, Coroutine, Iterable
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from inspect import isfunction, ismethod
 from io import BytesIO
 from itertools import chain, product
 from pathlib import Path
-import pickle
 from typing import (
+    TYPE_CHECKING,
     Any,
-    Callable,
     Dict,
-    Iterable,
     List,
     Optional,
     Set,
-    Union,
-    TYPE_CHECKING,
-    Coroutine,
     TypeVar,
+    Union,
 )
 
-from snakemake_interface_common.utils import lchmod
-from snakemake_interface_common.utils import lutime as lutime_raw
-from snakemake_interface_common.utils import not_iterable
 from snakemake_interface_common.io import AnnotatedStringInterface
+from snakemake_interface_common.utils import lchmod, not_iterable
+from snakemake_interface_common.utils import lutime as lutime_raw
+from snakemake_interface_storage_plugins.exceptions import FileOrDirectoryNotFoundError
 from snakemake_interface_storage_plugins.io import (
     WILDCARD_REGEX,
     IOCacheStorageInterface,
     Mtime,
     get_constant_prefix,
 )
-from snakemake_interface_storage_plugins.exceptions import FileOrDirectoryNotFoundError
 
 from snakemake.common import (
     ON_WINDOWS,
@@ -64,8 +61,8 @@ from snakemake.exceptions import (
 from snakemake.logging import logger
 
 if TYPE_CHECKING:
-    import snakemake.rules
     import snakemake.jobs
+    import snakemake.rules
     from snakemake.iocontainers import Namedlist
 
 
@@ -158,10 +155,8 @@ class IOCache(IOCacheStorageInterface):
         loaded = pickle.load(handle)
         if loaded.IOCACHE_VERSION != cls.IOCACHE_VERSION:
             raise IOCacheLoadError(
-                (
-                    f"Trying to load IOCache object with a mismatched version: "
-                    f"{loaded.IOCACHE_VERSION} (loaded) != {cls.IOCACHE_VERSION} (current)"
-                )
+                f"Trying to load IOCache object with a mismatched version: "
+                f"{loaded.IOCACHE_VERSION} (loaded) != {cls.IOCACHE_VERSION} (current)"
             )
         else:
             return loaded
@@ -215,7 +210,7 @@ class IOCache(IOCacheStorageInterface):
         ]
 
         for job in jobs:
-            f: "_IOFile"
+            f: _IOFile
             for f in chain(job.input, job.output):
                 if not f.is_storage and await f.exists():
                     queue.put_nowait(f)
@@ -308,16 +303,16 @@ class _IOFile(AnnotatedStringFormatMixin, str):
     A file that is either input or output of a rule.
     """
 
-    __slots__ = ["_is_callable", "_file", "rule", "_regex", "_wildcard_constraints"]
+    __slots__ = ["_file", "_is_callable", "_regex", "_wildcard_constraints", "rule"]
 
     if TYPE_CHECKING:
 
-        def __init__(self, file, rule: Optional["snakemake.rules.Rule"]):
+        def __init__(self, file, rule: "snakemake.rules.Rule" | None):
             self._is_callable: bool
-            self._file: str | AnnotatedString | Callable[["Namedlist"], str]
+            self._file: str | AnnotatedString | Callable[[Namedlist], str]
             self.rule: snakemake.rules.Rule | None
             self._regex: re.Pattern | None
-            self._wildcard_constraints: Dict[str, re.Pattern] | None
+            self._wildcard_constraints: dict[str, re.Pattern] | None
 
     def __new__(
         cls,
@@ -674,10 +669,10 @@ class _IOFile(AnnotatedStringFormatMixin, str):
 
     async def checksum(
         self,
-        threshold: Optional[int] = None,
+        threshold: int | None = None,
         force: bool = False,
         algorithm: None | str | Callable = None,
-    ) -> Optional[str]:
+    ) -> str | None:
         """Return checksum as "{algorithm}:{hexdigest}", or None.
 
         Returns None if the file does not exist or exceeds the size threshold.
@@ -693,7 +688,9 @@ class _IOFile(AnnotatedStringFormatMixin, str):
         algorithm_name = (
             None
             if algorithm is None
-            else algorithm if isinstance(algorithm, str) else algorithm().name
+            else algorithm
+            if isinstance(algorithm, str)
+            else algorithm().name
         )
 
         def check_algorithm(checksum):
@@ -752,8 +749,8 @@ class _IOFile(AnnotatedStringFormatMixin, str):
 
     async def is_same_checksum(
         self,
-        other_checksum: Optional[str],
-        threshold: Optional[int],
+        other_checksum: str | None,
+        threshold: int | None,
         force: bool = False,
     ) -> bool:
         """Return True if this file's checksum matches other_checksum.
@@ -786,7 +783,7 @@ class _IOFile(AnnotatedStringFormatMixin, str):
                     raise WorkflowError(
                         f"File {self.file} seems to be a broken symlink."
                     )
-            except FileNotFoundError as e:
+            except FileNotFoundError:
                 # there is no broken symlink present, hence all fine
                 return
 
@@ -875,7 +872,7 @@ class _IOFile(AnnotatedStringFormatMixin, str):
                 await self.storage_object.managed_touch()
             else:
                 raise WorkflowError(
-                    f"Storage does not support touch operation. Consider contributing to the used storage provider."
+                    "Storage does not support touch operation. Consider contributing to the used storage provider."
                 )
         else:
             self.touch()
@@ -1061,7 +1058,7 @@ class AnnotatedString(AnnotatedStringFormatMixin, str):
         return self.callable is not None
 
     @property
-    def flags(self) -> Dict[str, Any]:
+    def flags(self) -> dict[str, Any]:
         return self._flags
 
     @flags.setter
@@ -1141,7 +1138,7 @@ def check(
         )
 
 
-def get_flag_store_keys(flag_func: Callable) -> Set[str]:
+def get_flag_store_keys(flag_func: Callable) -> set[str]:
     return set(flag_func("dummy").flags.keys())
 
 
@@ -1176,7 +1173,7 @@ async def wait_for_files(
     latency_wait=3,
     wait_for_local=False,
     ignore_pipe_or_service=False,
-    consider_local: Set[_IOFile] = frozenset(),  # type: ignore[assignment]
+    consider_local: set[_IOFile] = frozenset(),  # type: ignore[assignment]
 ):
     """Wait for given files to be present in the filesystem."""
 
@@ -1229,7 +1226,7 @@ async def wait_for_files(
                 return
             time.sleep(sleep)
         missing = fmt_missing(await get_missing(list_parent=True))
-        raise IOError(
+        raise OSError(
             f"Missing files after {latency_wait} seconds. This might be due to "
             "filesystem latency. If that is the case, consider to increase the "
             "wait time with --latency-wait:\n"
@@ -1339,6 +1336,14 @@ def get_flag_value(value, flag_type):
             return None
 
 
+def external(value):
+    """
+    Mark input files as produced externally and allowed to
+    appear after initial DAG construction.
+    """
+    return flag(value, "external")
+
+
 def ancient(value):
     """
     A flag for an input file that shall be considered ancient; i.e. its timestamp shall have no effect on which jobs to run.
@@ -1380,14 +1385,14 @@ def temp(value, group_jobs=False):
 class QueueInfo:
     queue: queue.Queue
     finish_sentinel: Any
-    last_checked: Optional[float] = None
+    last_checked: float | None = None
     finished: bool = False
-    items: List[Any] = field(default_factory=list, init=False)
+    items: list[Any] = field(default_factory=list, init=False)
 
     def consume(self, wildcards):
-        assert (
-            self.finished is False
-        ), "bug: queue marked as finished but consume method called again"
+        assert self.finished is False, (
+            "bug: queue marked as finished but consume method called again"
+        )
 
         if wildcards:
             raise WorkflowError("from_queue() may not be used in rules with wildcards.")
@@ -1501,9 +1506,9 @@ def checkpoint_target(value):
 def sourcecache_entry(value, orig_path_or_uri):
     from snakemake.sourcecache import SourceFile
 
-    assert not isinstance(
-        orig_path_or_uri, SourceFile
-    ), "bug: sourcecache_entry should receive a path or uri, not a SourceFile"
+    assert not isinstance(orig_path_or_uri, SourceFile), (
+        "bug: sourcecache_entry should receive a path or uri, not a SourceFile"
+    )
     return flag(value, "sourcecache_entry", orig_path_or_uri)
 
 
@@ -1614,7 +1619,7 @@ def expand(*args, **wildcard_values):
         key: value
         for key, value in wildcard_values.items()
         if callable(value)
-        or (isinstance(value, List) and any(callable(v) for v in value))
+        or (isinstance(value, list) and any(callable(v) for v in value))
     }
 
     # remove unused wildcards to avoid duplicate filepatterns
@@ -1628,12 +1633,10 @@ def expand(*args, **wildcard_values):
     }
 
     def do_expand(
-        wildcard_values: Dict[
-            str, Dict[str, Union[str, collections.abc.Iterable[str]]]
-        ],
+        wildcard_values: dict[str, dict[str, str | collections.abc.Iterable[str]]],
     ):
         def flatten(
-            wildcard_values: Dict[str, Union[str, collections.abc.Iterable[str]]],
+            wildcard_values: dict[str, str | collections.abc.Iterable[str]],
         ):
             for wildcard, value in wildcard_values.items():
                 if (
@@ -1699,7 +1702,7 @@ def expand(*args, **wildcard_values):
 @dataclass
 class MultiextValue:
     prefix: str
-    name: Optional[str] = None
+    name: str | None = None
 
 
 def multiext(prefix, *extensions, **named_extensions):
@@ -1735,7 +1738,7 @@ def multiext(prefix, *extensions, **named_extensions):
 
 
 def is_multiext_items(
-    items: Union[str, _IOFile, Iterable[str], Iterable[_IOFile]],
+    items: str | _IOFile | Iterable[str] | Iterable[_IOFile],
 ) -> bool:
     return (
         isinstance(items, collections.abc.Iterable)
@@ -1744,7 +1747,7 @@ def is_multiext_items(
     )
 
 
-def limit(pattern: Union[str, AnnotatedString], **wildcards):
+def limit(pattern: str | AnnotatedString, **wildcards):
     """
     Limit wildcards to the given values.
 
@@ -1789,7 +1792,7 @@ def glob_wildcards(pattern, files=None, followlinks=False):
         dirname = "."
 
     _names = [match.group("name") for match in WILDCARD_REGEX.finditer(pattern)]
-    names: List[str] = sorted(set(_names), key=_names.index)
+    names: list[str] = sorted(set(_names), key=_names.index)
     Wildcards = collections.namedtuple("Wildcards", names)  # type: ignore[misc]
     wildcards = Wildcards(*[list() for name in names])
 
@@ -1814,8 +1817,8 @@ def glob_wildcards(pattern, files=None, followlinks=False):
 
 def update_wildcard_constraints(
     pattern,
-    wildcard_constraints: Dict[str, str],
-    global_wildcard_constraints: Dict[str, str],
+    wildcard_constraints: dict[str, str],
+    global_wildcard_constraints: dict[str, str],
 ):
     """Update wildcard constraints
 
@@ -1843,7 +1846,7 @@ def update_wildcard_constraints(
         else:
             return match.group(0)
 
-    examined_names: Set[str] = set()
+    examined_names: set[str] = set()
     updated = WILDCARD_REGEX.sub(replace_constraint, pattern)
 
     # inherit flags
@@ -1877,9 +1880,7 @@ class PeriodicityDetector:
         """
         self.min_repeat = min_repeat
         self.regex = re.compile(
-            "((?P<value>.+)(?P=value){{{min_repeat},{max_repeat}}})$".format(
-                min_repeat=min_repeat - 1, max_repeat=max_repeat - 1
-            )
+            f"((?P<value>.+)(?P=value){{{min_repeat - 1},{max_repeat - 1}}})$"
         )
 
     def is_periodic(self, value):
